@@ -3,29 +3,34 @@ require('dotenv').config();
 
 const TelegramBot = require('node-telegram-bot-api');
 const express = require('express');
-const Redis = require('ioredis'); // Import ioredis
+// const Redis = require('ioredis'); // Removed Redis import
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const PORT = process.env.PORT || 3000;
 const APP_URL = process.env.RAILWAY_STATIC_URL;
-const REDIS_URL = process.env.REDIS_URL; // Get Redis URL from environment
+// const REDIS_URL = process.env.REDIS_URL; // Removed Redis URL
 
 if (!BOT_TOKEN) {
   console.error('Error: TELEGRAM_BOT_TOKEN is not set!');
   process.exit(1);
 }
 
-// --- Initialize Redis Client ---
+// --- Initialize In-Memory Stores ---
+const chatTimers = new Map(); // chatId -> durationString | "off"
+const chatSchedules = new Map(); // chatId -> { startTime: "HH:MM", endTime: "HH:MM" | null, deleteDuration: "5m" | null, timezone: "GMT+6" }
+const chatWhitelists = new Map(); // chatId -> Array<userId>
+
+/*
+// --- Initialize Redis Client (REMOVED) ---
 let redisClient = null;
 if (REDIS_URL) {
-    redisClient = new Redis(REDIS_URL);
-    redisClient.on('connect', () => console.log('✅ Successfully connected to Redis!'));
-    redisClient.on('error', (err) => console.error('❌ Redis Connection Error:', err.message, err.stack));
+    // redisClient = new Redis(REDIS_URL);
+    // redisClient.on('connect', () => console.log('✅ Successfully connected to Redis!'));
+    // redisClient.on('error', (err) => console.error('❌ Redis Connection Error:', err.message, err.stack));
 } else {
-    console.warn('⚠️ REDIS_URL environment variable not found. Bot will use in-memory storage (not recommended for production, settings will be lost on restart).');
-    // For local testing without Redis, you might want to fall back to Maps,
-    // but for Railway deployment, REDIS_URL should be present if Redis service is added.
+    // console.warn('⚠️ REDIS_URL environment variable not found. Bot will use in-memory storage (not recommended for production, settings will be lost on restart).');
 }
+*/
 
 const bot = new TelegramBot(BOT_TOKEN);
 const app = express();
@@ -83,7 +88,7 @@ app.post(WEBHOOK_PATH, (req, res) => {
   res.sendStatus(200);
 });
 
-// --- Bot Commands (Modified to use Redis) ---
+// --- Bot Commands (Modified to use In-Memory Maps) ---
 
 bot.onText(/\/start/, (msg) => {
   const chatId = msg.chat.id;
@@ -120,11 +125,11 @@ bot.onText(/\/settimer (.+)/, async (msg, match) => {
   let replyText = '';
 
   if (inputDuration === 'off') {
-    if (redisClient) await redisClient.set(`timer:${chatId}`, 'off');
+    chatTimers.set(chatId, 'off'); // Use Map
     replyText = '⏰ Auto-delete timer is now OFF.';
   } else {
     if (parseDurationToMs(inputDuration)) {
-      if (redisClient) await redisClient.set(`timer:${chatId}`, inputDuration);
+      chatTimers.set(chatId, inputDuration); // Use Map
       replyText = `⏰ Auto-delete timer set to ${inputDuration}.`;
     } else {
       replyText = '⚠️ Invalid duration format. Use "10s", "5m", "1h", or "off".';
@@ -152,17 +157,13 @@ bot.onText(/\/schedule (.+)/, async (msg, match) => {
         return;
     }
     
-    let scheduleData = {};
-    if (redisClient) {
-        const scheduleJson = await redisClient.get(`schedule:${chatId}`);
-        if (scheduleJson) scheduleData = JSON.parse(scheduleJson);
-    }
+    const scheduleData = chatSchedules.get(chatId) || {}; // Use Map
     
     scheduleData.startTime = startTime;
     scheduleData.deleteDuration = deleteDuration;
     scheduleData.timezone = "GMT+6";
 
-    if (redisClient) await redisClient.set(`schedule:${chatId}`, JSON.stringify(scheduleData));
+    chatSchedules.set(chatId, scheduleData); // Use Map
     
     let messageText = `🗓️ Timer scheduled to be active from ${startTime} (GMT+6).`;
     if(scheduleData.endTime) messageText += ` It will turn off at ${scheduleData.endTime} (GMT+6).`;
@@ -184,15 +185,11 @@ bot.onText(/\/scheduleoff (.+)/, async (msg, match) => {
         return;
     }
 
-    let scheduleData = {};
-    if (redisClient) {
-        const scheduleJson = await redisClient.get(`schedule:${chatId}`);
-        if (scheduleJson) scheduleData = JSON.parse(scheduleJson);
-    }
+    const scheduleData = chatSchedules.get(chatId) || {}; // Use Map
     scheduleData.endTime = endTime;
     scheduleData.timezone = scheduleData.timezone || "GMT+6"; 
 
-    if (redisClient) await redisClient.set(`schedule:${chatId}`, JSON.stringify(scheduleData));
+    chatSchedules.set(chatId, scheduleData); // Use Map
     
     let messageText = `🗓️ Scheduled timer will now turn off at ${endTime} (GMT+6).`;
     if(scheduleData.startTime && scheduleData.deleteDuration) messageText += `\nIt is active from ${scheduleData.startTime} (GMT+6) deleting media after ${scheduleData.deleteDuration}.`;
@@ -212,17 +209,14 @@ bot.onText(/\/whitelist_him/, async (msg) => {
     }
     const userToWhitelist = msg.reply_to_message.from;
     let replyText = '';
-
-    if (redisClient) {
-        const isAlreadyMember = await redisClient.sismember(`whitelist:${chatId}`, userToWhitelist.id.toString());
-        if (!isAlreadyMember) {
-            await redisClient.sadd(`whitelist:${chatId}`, userToWhitelist.id.toString());
-            replyText = `✅ ${userToWhitelist.first_name} (@${userToWhitelist.username || 'User'}) has been added to the whitelist.`;
-        } else {
-            replyText = `👍 ${userToWhitelist.first_name} is already on the whitelist.`;
-        }
+    
+    let whitelist = chatWhitelists.get(chatId) || []; // Use Map
+    if (!whitelist.includes(userToWhitelist.id)) {
+        whitelist.push(userToWhitelist.id);
+        chatWhitelists.set(chatId, whitelist); // Use Map
+        replyText = `✅ ${userToWhitelist.first_name} (@${userToWhitelist.username || 'User'}) has been added to the whitelist.`;
     } else {
-        replyText = "⚠️ Database not available. Whitelist feature disabled.";
+        replyText = `👍 ${userToWhitelist.first_name} is already on the whitelist.`;
     }
     bot.sendMessage(chatId, escapeMarkdownV2(replyText) + MADE_BY_FOOTER, { parse_mode: 'MarkdownV2' });
 });
@@ -240,15 +234,14 @@ bot.onText(/\/remove_him/, async (msg) => {
     const userToRemove = msg.reply_to_message.from;
     let replyText = '';
 
-    if (redisClient) {
-        const removedCount = await redisClient.srem(`whitelist:${chatId}`, userToRemove.id.toString());
-        if (removedCount > 0) {
-            replyText = `🗑️ ${userToRemove.first_name} (@${userToRemove.username || 'User'}) has been removed from the whitelist.`;
-        } else {
-            replyText = `🤷 ${userToRemove.first_name} is not on the whitelist.`;
-        }
+    let whitelist = chatWhitelists.get(chatId) || []; // Use Map
+    const index = whitelist.indexOf(userToRemove.id);
+    if (index > -1) {
+        whitelist.splice(index, 1);
+        chatWhitelists.set(chatId, whitelist); // Use Map
+        replyText = `🗑️ ${userToRemove.first_name} (@${userToRemove.username || 'User'}) has been removed from the whitelist.`;
     } else {
-        replyText = "⚠️ Database not available. Whitelist feature disabled.";
+        replyText = `🤷 ${userToRemove.first_name} is not on the whitelist.`;
     }
     bot.sendMessage(chatId, escapeMarkdownV2(replyText) + MADE_BY_FOOTER, { parse_mode: 'MarkdownV2' });
 });
@@ -266,19 +259,11 @@ bot.onText(/\/status/, async (msg) => {
   let statusMessage = "📊 Current Bot Configuration:\n\n";
 
   // General Timer
-  let groupTimer = DEFAULT_TIMER_DURATION;
-  if (redisClient) {
-      const redisVal = await redisClient.get(`timer:${chatId}`);
-      if (redisVal !== null) groupTimer = redisVal;
-  }
+  const groupTimer = chatTimers.get(chatId) || DEFAULT_TIMER_DURATION; // Use Map
   statusMessage += `⏰ General Timer: ${groupTimer === 'off' ? 'OFF' : `Deletes after ${groupTimer}`}\n`;
 
   // Schedule
-  let schedule = null;
-  if (redisClient) {
-      const scheduleJson = await redisClient.get(`schedule:${chatId}`);
-      if (scheduleJson) schedule = JSON.parse(scheduleJson);
-  }
+  const schedule = chatSchedules.get(chatId); // Use Map
   if (schedule && schedule.startTime && schedule.deleteDuration) {
       statusMessage += `🗓️ Scheduled Active Period (GMT+6):\n`;
       statusMessage += `   - Starts: ${schedule.startTime}\n`;
@@ -289,37 +274,27 @@ bot.onText(/\/status/, async (msg) => {
   }
 
   // Whitelist
-  let whitelistCount = 0;
-  if (redisClient) {
-      whitelistCount = await redisClient.scard(`whitelist:${chatId}`); // scard gets the number of elements in a set
-  }
-  statusMessage += `🛡️ Whitelisted Users: ${whitelistCount} user(s).\n`;
+  const whitelist = chatWhitelists.get(chatId) || []; // Use Map
+  statusMessage += `🛡️ Whitelisted Users: ${whitelist.length} user(s).\n`;
   
   statusMessage += `\n📸 Media with a time in caption (e.g., 'pic 30s') will use that specific time.`;
 
   bot.sendMessage(chatId, escapeMarkdownV2(statusMessage) + MADE_BY_FOOTER, { parse_mode: 'MarkdownV2' });
 });
 
-// --- Media Processing Logic (Modified to use Redis) ---
-bot.on('photo', (msg) => processMedia(msg));
+// --- Media Processing Logic (Using In-Memory Maps) ---
+bot.on('photo', (msg) => processMedia(msg)); // No longer needs to be async if not calling Redis
 bot.on('video', (msg) => processMedia(msg));
 
-async function processMedia(msg) { // Made async to use await for Redis
+function processMedia(msg) { // Removed async as Redis calls are removed
   const chatId = msg.chat.id;
   const messageId = msg.message_id;
   const userId = msg.from.id;
   const caption = msg.caption ? msg.caption.trim() : '';
 
   // 1. Check Whitelist
-  let isUserWhitelisted = false;
-  if (redisClient) {
-      try {
-        isUserWhitelisted = await redisClient.sismember(`whitelist:${chatId}`, userId.toString()) === 1;
-      } catch(err) {
-        console.error("Redis sismember error:", err.message);
-      }
-  }
-  if (isUserWhitelisted) {
+  const whitelist = chatWhitelists.get(chatId) || []; // Use Map
+  if (whitelist.includes(userId)) {
     console.log(`Chat ${chatId}: User ${userId} is whitelisted. Not deleting message ${messageId}.`);
     return;
   }
@@ -337,38 +312,34 @@ async function processMedia(msg) { // Made async to use await for Redis
   }
 
   // 3. Check Active Schedule Timer (If no caption timer)
-  if (!timerToUse && redisClient) {
-    const scheduleJson = await redisClient.get(`schedule:${chatId}`);
-    if (scheduleJson) {
-        const schedule = JSON.parse(scheduleJson);
-        if (schedule && schedule.startTime && schedule.deleteDuration) {
-            const { hours: currentHourGMT6, minutes: currentMinuteGMT6 } = getCurrentTimeInGMT6();
-            const currentTimeInMinutesGMT6 = currentHourGMT6 * 60 + currentMinuteGMT6;
-            const [startH, startM] = schedule.startTime.split(':').map(Number);
-            const startTimeInMinutesGMT6 = startH * 60 + startM;
-            let endTimeInMinutesGMT6 = Infinity; 
-            if(schedule.endTime) {
-                const [endH, endM] = schedule.endTime.split(':').map(Number);
-                endTimeInMinutesGMT6 = endH * 60 + endM;
-            }
-            let isActiveSchedule = false;
-            if (startTimeInMinutesGMT6 <= endTimeInMinutesGMT6) { 
-                if (currentTimeInMinutesGMT6 >= startTimeInMinutesGMT6 && currentTimeInMinutesGMT6 < endTimeInMinutesGMT6) isActiveSchedule = true;
-            } else { 
-                if (currentTimeInMinutesGMT6 >= startTimeInMinutesGMT6 || currentTimeInMinutesGMT6 < endTimeInMinutesGMT6) isActiveSchedule = true;
-            }
-            if (isActiveSchedule) {
-                timerToUse = schedule.deleteDuration;
-                console.log(`Chat ${chatId}: Using active schedule timer "${timerToUse}" for message ${messageId}`);
-            }
+  if (!timerToUse) {
+    const schedule = chatSchedules.get(chatId); // Use Map
+    if (schedule && schedule.startTime && schedule.deleteDuration) {
+        const { hours: currentHourGMT6, minutes: currentMinuteGMT6 } = getCurrentTimeInGMT6();
+        const currentTimeInMinutesGMT6 = currentHourGMT6 * 60 + currentMinuteGMT6;
+        const [startH, startM] = schedule.startTime.split(':').map(Number);
+        const startTimeInMinutesGMT6 = startH * 60 + startM;
+        let endTimeInMinutesGMT6 = Infinity; 
+        if(schedule.endTime) {
+            const [endH, endM] = schedule.endTime.split(':').map(Number);
+            endTimeInMinutesGMT6 = endH * 60 + endM;
+        }
+        let isActiveSchedule = false;
+        if (startTimeInMinutesGMT6 <= endTimeInMinutesGMT6) { 
+            if (currentTimeInMinutesGMT6 >= startTimeInMinutesGMT6 && currentTimeInMinutesGMT6 < endTimeInMinutesGMT6) isActiveSchedule = true;
+        } else { 
+            if (currentTimeInMinutesGMT6 >= startTimeInMinutesGMT6 || currentTimeInMinutesGMT6 < endTimeInMinutesGMT6) isActiveSchedule = true;
+        }
+        if (isActiveSchedule) {
+            timerToUse = schedule.deleteDuration;
+            console.log(`Chat ${chatId}: Using active schedule timer "${timerToUse}" for message ${messageId}`);
         }
     }
   }
 
   // 4. Group Timer (If no caption or active schedule timer)
-  if (!timerToUse && redisClient) {
-    const groupTimerVal = await redisClient.get(`timer:${chatId}`);
-    if (groupTimerVal !== null) timerToUse = groupTimerVal;
+  if (!timerToUse) {
+    timerToUse = chatTimers.get(chatId); // Use Map
   }
   
   // 5. Bot Default Timer (If no other timer is set and group timer is not "off")
@@ -402,21 +373,21 @@ async function processMedia(msg) { // Made async to use await for Redis
   }
 }
 
-// --- Start App (unchanged from previous Redis integration step) ---
+// --- Start App ---
 async function startApp() {
-  if (process.env.NODE_ENV === 'development' || !APP_URL || !REDIS_URL) { // Added !REDIS_URL for local fallback
-    console.log('🤖 Starting bot with polling for local development (Redis may not be available)...');
-    if(!REDIS_URL) console.warn("   (Running without Redis, settings will be in-memory and lost on restart)");
+  // Removed REDIS_URL check for local development as Redis is no longer used
+  if (process.env.NODE_ENV === 'development' || !APP_URL ) { 
+    console.log('🤖 Starting bot with polling for local development...');
     bot.startPolling()
       .then(() => console.log('✅ Bot polling started successfully.'))
       .catch(err => console.error('❌ Polling error:', err));
     app.listen(PORT, () => {
         console.log(`🚀 Express server listening on port ${PORT} for potential local webhook testing.`);
     });
-  } else { // Production on Railway with REDIS_URL and APP_URL
+  } else { // Production on Railway with APP_URL
     app.listen(PORT, async () => {
       console.log(`🚀 Bot server started on port ${PORT}. Setting up webhook...`);
-      if (APP_URL && BOT_TOKEN) { // REDIS_URL is implicitly expected to be set here
+      if (APP_URL && BOT_TOKEN) {
         const webhookUrl = `https://${APP_URL}${WEBHOOK_PATH}`;
         try {
           await bot.setWebHook(webhookUrl);
