@@ -24,6 +24,8 @@ app.use(express.json());
 
 const DEFAULT_TIMER_DURATION = '15m';
 const MADE_BY_FOOTER = "\n\nMade by [Trendy Tribe](https://t.me/+Mlo9njp07m01ZTY1)";
+const BOT_REPLY_DELETE_DELAY = 60000; // 1 minute in milliseconds for bot's replies
+const USER_COMMAND_DELETE_DELAY = 10000; // 10 seconds for user's commands
 
 // --- Helper Functions ---
 function parseDurationToMs(durationStr) {
@@ -52,19 +54,12 @@ async function isAdmin(msg) { // Takes the full message object
     const chatId = msg.chat.id;
     const userId = msg.from.id;
 
-    if (msg.chat.type === 'private') { // Commands can be used in private chat with the bot
+    if (msg.chat.type === 'private') {
         return true;
     }
-
-    // Check if the message is from an anonymous admin (sent on behalf of the chat)
-    // For group anonymous admins, msg.from.id is typically 136817688 (GroupAnonymousBot)
-    // and msg.sender_chat.id is the group's ID.
-    // Only actual admins can send messages "anonymously" (i.e., on behalf of the group).
     if (msg.sender_chat && msg.sender_chat.id === chatId) {
         return true; 
     }
-
-    // For regular, named users, check their member status
     if (userId) {
         try {
             const member = await bot.getChatMember(chatId, userId);
@@ -74,7 +69,7 @@ async function isAdmin(msg) { // Takes the full message object
             return false;
         }
     }
-    return false; // Default to false if no other condition met
+    return false;
 }
 
 function escapeMarkdownV2(text) {
@@ -83,16 +78,19 @@ function escapeMarkdownV2(text) {
   return text.replace(new RegExp(`([${escapeChars.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&')}])`, 'g'), '\\$1');
 }
 
-function autoDeleteMessage(chatId, messageId, delay = 10000) {
+function autoDeleteMessage(chatId, messageId, delay = USER_COMMAND_DELETE_DELAY) {
     setTimeout(() => {
         bot.deleteMessage(chatId, messageId).catch(err => {
-            console.log(`RAILWAY LOG: Could not auto-delete message ${messageId} in chat ${chatId}: ${err.message}`);
+            // It's okay if the message is already deleted or not found
+            if (!err.message.includes("message to delete not found") && !err.message.includes("message can't be deleted")) {
+                console.log(`RAILWAY LOG: Could not auto-delete message ${messageId} in chat ${chatId}: ${err.message}`);
+            }
         });
     }, delay);
 }
 
 // --- Webhook ---
-const WEBHOOK_PATH = `/webhook/${BOT_TOKEN}`; // Or a custom secret path
+const WEBHOOK_PATH = `/webhook/${BOT_TOKEN}`;
 app.post(WEBHOOK_PATH, (req, res) => {
   bot.processUpdate(req.body);
   res.sendStatus(200);
@@ -102,10 +100,6 @@ app.post(WEBHOOK_PATH, (req, res) => {
 
 bot.onText(/\/start/, (msg) => {
   const chatId = msg.chat.id;
-  // Auto-delete the /start command message if it's from a group (optional, usually /start is not deleted)
-  // if (msg.chat.type !== 'private') {
-  //   autoDeleteMessage(chatId, msg.message_id);
-  // }
   const welcomeMessage = `👋 Welcome to Auto-Delete Media Bot!
 
 📌 To use this bot:
@@ -121,26 +115,34 @@ bot.onText(/\/start/, (msg) => {
   /status – Show current configuration (All users)
 
 📸 Media with a time in caption (e.g., 'my pic 30s') will use that specific time for deletion (works for all users).`;
-  bot.sendMessage(chatId, escapeMarkdownV2(welcomeMessage) + MADE_BY_FOOTER, { parse_mode: 'MarkdownV2' });
+  bot.sendMessage(chatId, escapeMarkdownV2(welcomeMessage) + MADE_BY_FOOTER, { parse_mode: 'MarkdownV2' })
+    .then(sentMessage => {
+        if (sentMessage) {
+            autoDeleteMessage(sentMessage.chat.id, sentMessage.message_id, BOT_REPLY_DELETE_DELAY);
+        }
+    }).catch(err => console.error(`RAILWAY LOG: Error sending /start reply: ${err.message}`));
 });
 
 bot.onText(/\/settimer (.+)/, async (msg, match) => {
   const chatId = msg.chat.id;
-  const messageId = msg.message_id;
+  const userCommandMessageId = msg.message_id;
+  let replyText = '';
 
   if (!(await isAdmin(msg))) {
     if (msg.chat.type !== 'private') {
-        bot.sendMessage(chatId, escapeMarkdownV2("🚫 Only admins can use this command.") + MADE_BY_FOOTER, { parse_mode: 'MarkdownV2' });
-        autoDeleteMessage(chatId, messageId); // Delete non-admin's command
+        replyText = "🚫 Only admins can use this command.";
+        bot.sendMessage(chatId, escapeMarkdownV2(replyText) + MADE_BY_FOOTER, { parse_mode: 'MarkdownV2' })
+            .then(sentMessage => {
+                if (sentMessage) autoDeleteMessage(sentMessage.chat.id, sentMessage.message_id, BOT_REPLY_DELETE_DELAY);
+            }).catch(err => console.error(`RAILWAY LOG: Error sending admin restriction reply for /settimer: ${err.message}`));
+        autoDeleteMessage(chatId, userCommandMessageId); 
         return; 
     }
   }
   
-  autoDeleteMessage(chatId, messageId); // Delete admin's command after processing
+  autoDeleteMessage(chatId, userCommandMessageId); 
 
   const inputDuration = match[1].trim().toLowerCase();
-  let replyText = '';
-
   if (inputDuration === 'off') {
     chatTimers.set(chatId, 'off');
     replyText = '⏰ Auto-delete timer is now OFF.';
@@ -152,32 +154,48 @@ bot.onText(/\/settimer (.+)/, async (msg, match) => {
       replyText = '⚠️ Invalid duration format. Use "10s", "5m", "1h", or "off".';
     }
   }
-  bot.sendMessage(chatId, escapeMarkdownV2(replyText) + MADE_BY_FOOTER, { parse_mode: 'MarkdownV2' });
+  bot.sendMessage(chatId, escapeMarkdownV2(replyText) + MADE_BY_FOOTER, { parse_mode: 'MarkdownV2' })
+    .then(sentMessage => {
+        if (sentMessage) autoDeleteMessage(sentMessage.chat.id, sentMessage.message_id, BOT_REPLY_DELETE_DELAY);
+    }).catch(err => console.error(`RAILWAY LOG: Error sending /settimer reply: ${err.message}`));
 });
 
 bot.onText(/\/schedule (.+)/, async (msg, match) => {
     const chatId = msg.chat.id;
-    const messageId = msg.message_id;
+    const userCommandMessageId = msg.message_id;
+    let replyText = '';
 
     if (!(await isAdmin(msg))) {
         if (msg.chat.type !== 'private') {
-            bot.sendMessage(chatId, escapeMarkdownV2("🚫 Only admins can use this command.") + MADE_BY_FOOTER, { parse_mode: 'MarkdownV2' });
-            autoDeleteMessage(chatId, messageId);
+            replyText = "🚫 Only admins can use this command.";
+            bot.sendMessage(chatId, escapeMarkdownV2(replyText) + MADE_BY_FOOTER, { parse_mode: 'MarkdownV2' })
+                .then(sentMessage => {
+                    if (sentMessage) autoDeleteMessage(sentMessage.chat.id, sentMessage.message_id, BOT_REPLY_DELETE_DELAY);
+                }).catch(err => console.error(`RAILWAY LOG: Error sending admin restriction reply for /schedule: ${err.message}`));
+            autoDeleteMessage(chatId, userCommandMessageId);
             return;
         }
     }
-    autoDeleteMessage(chatId, messageId);
+    autoDeleteMessage(chatId, userCommandMessageId);
 
     const args = match[1].trim().split(' ');
     if (args.length !== 2) {
-        bot.sendMessage(chatId, escapeMarkdownV2('⚠️ Invalid format. Use: /schedule <HH:MM_start> <delete_duration>\nExample: /schedule 22:00 5m') + MADE_BY_FOOTER, { parse_mode: 'MarkdownV2' });
+        replyText = '⚠️ Invalid format. Use: /schedule <HH:MM_start> <delete_duration>\nExample: /schedule 22:00 5m';
+        bot.sendMessage(chatId, escapeMarkdownV2(replyText) + MADE_BY_FOOTER, { parse_mode: 'MarkdownV2' })
+            .then(sentMessage => {
+                if (sentMessage) autoDeleteMessage(sentMessage.chat.id, sentMessage.message_id, BOT_REPLY_DELETE_DELAY);
+            }).catch(err => console.error(`RAILWAY LOG: Error sending /schedule format error reply: ${err.message}`));
         return;
     }
     const startTime = args[0]; 
     const deleteDuration = args[1].toLowerCase(); 
 
     if (!/^\d{2}:\d{2}$/.test(startTime) || !parseDurationToMs(deleteDuration)) {
-        bot.sendMessage(chatId, escapeMarkdownV2('⚠️ Invalid time or duration format.\nStart time: HH:MM. Delete duration: 5m, 10s, 1h.') + MADE_BY_FOOTER, { parse_mode: 'MarkdownV2' });
+        replyText = '⚠️ Invalid time or duration format.\nStart time: HH:MM. Delete duration: 5m, 10s, 1h.';
+        bot.sendMessage(chatId, escapeMarkdownV2(replyText) + MADE_BY_FOOTER, { parse_mode: 'MarkdownV2' })
+            .then(sentMessage => {
+                if (sentMessage) autoDeleteMessage(sentMessage.chat.id, sentMessage.message_id, BOT_REPLY_DELETE_DELAY);
+            }).catch(err => console.error(`RAILWAY LOG: Error sending /schedule time/duration error reply: ${err.message}`));
         return;
     }
     
@@ -191,25 +209,37 @@ bot.onText(/\/schedule (.+)/, async (msg, match) => {
     if(scheduleData.endTime) messageText += ` It will turn off at ${scheduleData.endTime} (GMT+6).`;
     else messageText += ` No specific off time set yet (use /scheduleoff HH:MM).`;
     messageText += `\nDuring this active period, media will be deleted after ${deleteDuration}.`;
-    bot.sendMessage(chatId, escapeMarkdownV2(messageText) + MADE_BY_FOOTER, { parse_mode: 'MarkdownV2' });
+    bot.sendMessage(chatId, escapeMarkdownV2(messageText) + MADE_BY_FOOTER, { parse_mode: 'MarkdownV2' })
+        .then(sentMessage => {
+            if (sentMessage) autoDeleteMessage(sentMessage.chat.id, sentMessage.message_id, BOT_REPLY_DELETE_DELAY);
+        }).catch(err => console.error(`RAILWAY LOG: Error sending /schedule success reply: ${err.message}`));
 });
 
 bot.onText(/\/scheduleoff (.+)/, async (msg, match) => {
     const chatId = msg.chat.id;
-    const messageId = msg.message_id;
+    const userCommandMessageId = msg.message_id;
+    let replyText = '';
 
     if (!(await isAdmin(msg))) {
         if (msg.chat.type !== 'private') {
-            bot.sendMessage(chatId, escapeMarkdownV2("🚫 Only admins can use this command.") + MADE_BY_FOOTER, { parse_mode: 'MarkdownV2' });
-            autoDeleteMessage(chatId, messageId);
+            replyText = "🚫 Only admins can use this command.";
+            bot.sendMessage(chatId, escapeMarkdownV2(replyText) + MADE_BY_FOOTER, { parse_mode: 'MarkdownV2' })
+                .then(sentMessage => {
+                    if (sentMessage) autoDeleteMessage(sentMessage.chat.id, sentMessage.message_id, BOT_REPLY_DELETE_DELAY);
+                }).catch(err => console.error(`RAILWAY LOG: Error sending admin restriction reply for /scheduleoff: ${err.message}`));
+            autoDeleteMessage(chatId, userCommandMessageId);
             return;
         }
     }
-    autoDeleteMessage(chatId, messageId);
+    autoDeleteMessage(chatId, userCommandMessageId);
 
     const endTime = match[1].trim(); 
     if (!/^\d{2}:\d{2}$/.test(endTime)) {
-        bot.sendMessage(chatId, escapeMarkdownV2('⚠️ Invalid time format. End time should be HH:MM (e.g., 08:00).') + MADE_BY_FOOTER, { parse_mode: 'MarkdownV2' });
+        replyText = '⚠️ Invalid time format. End time should be HH:MM (e.g., 08:00).';
+        bot.sendMessage(chatId, escapeMarkdownV2(replyText) + MADE_BY_FOOTER, { parse_mode: 'MarkdownV2' })
+            .then(sentMessage => {
+                if (sentMessage) autoDeleteMessage(sentMessage.chat.id, sentMessage.message_id, BOT_REPLY_DELETE_DELAY);
+            }).catch(err => console.error(`RAILWAY LOG: Error sending /scheduleoff format error reply: ${err.message}`));
         return;
     }
 
@@ -221,15 +251,16 @@ bot.onText(/\/scheduleoff (.+)/, async (msg, match) => {
     let messageText = `🗓️ Scheduled timer will now turn off at ${endTime} (GMT+6).`;
     if(scheduleData.startTime && scheduleData.deleteDuration) messageText += `\nIt is active from ${scheduleData.startTime} (GMT+6) deleting media after ${scheduleData.deleteDuration}.`;
     else messageText += `\nℹ️ Note: Schedule start time and delete duration are not set. Use /schedule HH:MM <duration>.`;
-    bot.sendMessage(chatId, escapeMarkdownV2(messageText) + MADE_BY_FOOTER, { parse_mode: 'MarkdownV2' });
+    bot.sendMessage(chatId, escapeMarkdownV2(messageText) + MADE_BY_FOOTER, { parse_mode: 'MarkdownV2' })
+        .then(sentMessage => {
+            if (sentMessage) autoDeleteMessage(sentMessage.chat.id, sentMessage.message_id, BOT_REPLY_DELETE_DELAY);
+        }).catch(err => console.error(`RAILWAY LOG: Error sending /scheduleoff success reply: ${err.message}`));
 });
 
-// Whitelist commands removed
-
-bot.onText(/\/status/, async (msg) => { // No admin check, all users can use
+bot.onText(/\/status/, async (msg) => {
   const chatId = msg.chat.id;
-  const messageId = msg.message_id;
-  autoDeleteMessage(chatId, messageId); // Auto-delete the /status command
+  const userCommandMessageId = msg.message_id;
+  autoDeleteMessage(chatId, userCommandMessageId, USER_COMMAND_DELETE_DELAY); 
 
   let statusMessage = "📊 Current Bot Configuration:\n\n";
   const groupTimer = chatTimers.get(chatId) || DEFAULT_TIMER_DURATION;
@@ -245,9 +276,11 @@ bot.onText(/\/status/, async (msg) => { // No admin check, all users can use
       statusMessage += `🗓️ Scheduled Active Period: Not configured or OFF.\n`;
   }
   
-  // Whitelist info removed from status
   statusMessage += `\n📸 Media with a time in caption (e.g., 'pic 30s') will use that specific time.`;
-  bot.sendMessage(chatId, escapeMarkdownV2(statusMessage) + MADE_BY_FOOTER, { parse_mode: 'MarkdownV2' });
+  bot.sendMessage(chatId, escapeMarkdownV2(statusMessage) + MADE_BY_FOOTER, { parse_mode: 'MarkdownV2' })
+    .then(sentMessage => {
+        if (sentMessage) autoDeleteMessage(sentMessage.chat.id, sentMessage.message_id, BOT_REPLY_DELETE_DELAY);
+    }).catch(err => console.error(`RAILWAY LOG: Error sending /status reply: ${err.message}`));
 });
 
 // --- Media Processing Logic ---
@@ -257,15 +290,7 @@ bot.on('video', (msg) => processMedia(msg));
 function processMedia(msg) {
   const chatId = msg.chat.id;
   const messageId = msg.message_id;
-  // const userId = msg.from.id; // No longer needed for whitelist
   const caption = msg.caption ? msg.caption.trim() : '';
-
-  // Whitelist check removed
-  // const whitelist = chatWhitelists.get(chatId) || [];
-  // if (whitelist.includes(userId)) {
-  //   console.log(`Chat ${chatId}: User ${userId} is whitelisted. Not deleting message ${messageId}.`);
-  //   return;
-  // }
 
   let timerToUse = null; 
   const captionDurationMatch = caption.toLowerCase().match(/(\b\d+[smh]\b)/);
@@ -325,7 +350,10 @@ function processMedia(msg) {
         .catch((error) => {
           if (error.response && error.response.body) {
             const errorBody = typeof error.response.body === 'string' ? JSON.parse(error.response.body) : error.response.body;
-            console.error(`RAILWAY LOG: Chat ${chatId}: Failed to delete message ${messageId} (API Error): ${errorBody.description || error.message}`);
+            // Avoid logging "message to delete not found" as a critical error, it's common
+            if (!errorBody.description || !errorBody.description.includes("message to delete not found")) {
+                 console.error(`RAILWAY LOG: Chat ${chatId}: Failed to delete message ${messageId} (API Error): ${errorBody.description || error.message}`);
+            }
           } else {
             console.error(`RAILWAY LOG: Chat ${chatId}: Failed to delete message ${messageId} (Network/Other Error): ${error.message}`);
           }
@@ -347,10 +375,10 @@ async function startApp() {
         console.log(`🚀 Express server listening on port ${PORT} for potential local webhook testing.`);
     });
   } else { // Production on Railway with APP_URL
-    app.listen(PORT, '0.0.0.0', async () => { // Listen on 0.0.0.0 for Railway
+    app.listen(PORT, '0.0.0.0', async () => { 
       console.log(`🚀 Bot server started on port ${PORT}. Setting up webhook...`);
       if (APP_URL && BOT_TOKEN) {
-        const webhookUrl = `https://${APP_URL}${WEBHOOK_PATH}`; // Ensure WEBHOOK_PATH is defined using BOT_TOKEN or a custom secret
+        const webhookUrl = `https://${APP_URL}${WEBHOOK_PATH}`;
         try {
           await bot.setWebHook(webhookUrl);
           console.log(`✅ Webhook set to ${webhookUrl}`);
